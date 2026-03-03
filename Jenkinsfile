@@ -1,34 +1,26 @@
 pipeline {
-  agent any
-
-  options {
-    timestamps()
-    disableConcurrentBuilds()
-  }
+  agent { label 'fintech-agent' }
 
   environment {
     AWS_REGION   = "eu-central-1"
-    CLUSTER_NAME = "fintech-dev-cluster"
-    SERVICE_NAME = "fintech-dev-svc"
-    ECR_REPO     = "051826742726.dkr.ecr.eu-central-1.amazonaws.com/fintech-dev-api"
-    APP_DIR      = "app"
-    SMOKE_URL    = "http://fintech-dev-alb-1109785864.eu-central-1.elb.amazonaws.com/"
+    ACCOUNT_ID   = "051826742726"
+    ECR_REPO     = "fintech-dev-api"
+    ECR_URI      = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+
+    ECS_CLUSTER  = "fintech-dev-cluster"
+    ECS_SERVICE  = "fintech-dev-svc"
+
+    TASK_FAMILY  = "fintech-dev-task"
+    CONTAINER_NAME = "app"
   }
+
+  options { timestamps() }
+
+  triggers { githubPush() }
 
   stages {
     stage("Checkout") {
       steps { checkout scm }
-    }
-
-    stage("Compute image tag") {
-      steps {
-        script {
-          def sha = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
-          env.IMAGE_TAG = "v${env.BUILD_NUMBER}-${sha}"
-          env.IMAGE_URI = "${env.ECR_REPO}:${env.IMAGE_TAG}"
-          echo "IMAGE_URI=${env.IMAGE_URI}"
-        }
-      }
     }
 
     stage("Build Docker image") {
@@ -36,7 +28,10 @@ pipeline {
         sh '''
           set -euo pipefail
           docker --version
-          docker build -t "$IMAGE_URI" "./$APP_DIR"
+          GIT_SHA=$(git rev-parse --short=8 HEAD)
+          IMAGE_TAG="b${BUILD_NUMBER}-${GIT_SHA}"
+          echo "${IMAGE_TAG}" > .image_tag
+          docker build -t ${ECR_REPO}:${IMAGE_TAG} ./app
         '''
       }
     }
@@ -46,8 +41,8 @@ pipeline {
         sh '''
           set -euo pipefail
           aws --version
-          aws ecr get-login-password --region "$AWS_REGION" \
-            | docker login --username AWS --password-stdin "$(echo $ECR_REPO | cut -d/ -f1)"
+          aws ecr get-login-password --region ${AWS_REGION} \
+            | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
         '''
       }
     }
@@ -56,80 +51,99 @@ pipeline {
       steps {
         sh '''
           set -euo pipefail
-          docker push "$IMAGE_URI"
+          IMAGE_TAG=$(cat .image_tag)
+          docker tag ${ECR_REPO}:${IMAGE_TAG} ${ECR_URI}:${IMAGE_TAG}
+          docker push ${ECR_URI}:${IMAGE_TAG}
+
+          # optional convenience tag
+          docker tag ${ECR_REPO}:${IMAGE_TAG} ${ECR_URI}:latest
+          docker push ${ECR_URI}:latest
         '''
       }
     }
 
-    stage("Deploy to ECS (new task definition)") {
+    stage("Register new Task Definition revision") {
       steps {
         sh '''
           set -euo pipefail
-
-          echo "Deploying: $IMAGE_URI"
-
-          TD_ARN=$(aws ecs describe-services \
-            --cluster "$CLUSTER_NAME" \
-            --services "$SERVICE_NAME" \
-            --region "$AWS_REGION" \
-            --query "services[0].taskDefinition" \
-            --output text)
-
-          echo "Current TD: $TD_ARN"
+          IMAGE_TAG=$(cat .image_tag)
+          export NEW_IMAGE="${ECR_URI}:${IMAGE_TAG}"
+          export CONTAINER_NAME="${CONTAINER_NAME}"
+          echo "New image: ${NEW_IMAGE}"
 
           aws ecs describe-task-definition \
-            --task-definition "$TD_ARN" \
-            --region "$AWS_REGION" \
-            --query "taskDefinition" \
-            --output json > td.json
+            --task-definition ${TASK_FAMILY} \
+            --region ${AWS_REGION} \
+            --query taskDefinition \
+            --output json > taskdef.json
 
-          python - <<'PY'
+          PYBIN=$(command -v python3 || command -v python)
+
+          ${PYBIN} - <<'PY'
 import json, os
-with open("td.json") as f:
-    td = json.load(f)
+
+container_name = os.environ["CONTAINER_NAME"]
+new_image      = os.environ["NEW_IMAGE"]
+
+td = json.load(open("taskdef.json"))
 
 for k in ["taskDefinitionArn","revision","status","requiresAttributes","compatibilities","registeredAt","registeredBy"]:
     td.pop(k, None)
 
-# Update container image (assumes first container is app)
-td["containerDefinitions"][0]["image"] = os.environ["IMAGE_URI"]
+found = False
+for c in td.get("containerDefinitions", []):
+    if c.get("name") == container_name:
+        c["image"] = new_image
+        found = True
+        break
 
-with open("td-new.json","w") as f:
-    json.dump(td, f)
+if not found:
+    raise SystemExit(f"ERROR: container name '{container_name}' not found in task definition")
+
+json.dump(td, open("taskdef.register.json","w"))
+print("Wrote taskdef.register.json with updated image:", new_image)
 PY
 
-          NEW_TD_ARN=$(aws ecs register-task-definition \
-            --cli-input-json file://td-new.json \
-            --region "$AWS_REGION" \
+          NEW_TASKDEF_ARN=$(aws ecs register-task-definition \
+            --region ${AWS_REGION} \
+            --cli-input-json file://taskdef.register.json \
             --query "taskDefinition.taskDefinitionArn" \
             --output text)
 
-          echo "New TD: $NEW_TD_ARN"
-
-          aws ecs update-service \
-            --cluster "$CLUSTER_NAME" \
-            --service "$SERVICE_NAME" \
-            --task-definition "$NEW_TD_ARN" \
-            --region "$AWS_REGION" >/dev/null
-
-          aws ecs wait services-stable \
-            --cluster "$CLUSTER_NAME" \
-            --services "$SERVICE_NAME" \
-            --region "$AWS_REGION"
-
-          echo "ECS is stable."
+          echo "New task definition: ${NEW_TASKDEF_ARN}"
+          echo "${NEW_TASKDEF_ARN}" > .new_taskdef_arn
         '''
       }
     }
 
-    stage("Smoke test") {
+    stage("Deploy (update ECS service)") {
       steps {
         sh '''
           set -euo pipefail
-          echo "Testing: $SMOKE_URL"
-          curl -fsS "$SMOKE_URL" | head -n 5 || true
-          curl -fsSI "$SMOKE_URL" | head -n 20
-          echo "Smoke test OK"
+          NEW_TASKDEF_ARN=$(cat .new_taskdef_arn)
+
+          aws ecs update-service \
+            --cluster ${ECS_CLUSTER} \
+            --service ${ECS_SERVICE} \
+            --task-definition "${NEW_TASKDEF_ARN}" \
+            --region ${AWS_REGION}
+
+          aws ecs wait services-stable \
+            --cluster ${ECS_CLUSTER} \
+            --services ${ECS_SERVICE} \
+            --region ${AWS_REGION}
+        '''
+      }
+    }
+
+    stage("Smoke test (ALB)") {
+      steps {
+        sh '''
+          set -euo pipefail
+          ALB_DNS="fintech-dev-alb-1109785864.eu-central-1.elb.amazonaws.com"
+          echo "Hitting: http://${ALB_DNS}/"
+          curl -sS -o /tmp/out.html -w "HTTP=%{http_code}\n" "http://${ALB_DNS}/"
+          head -n 20 /tmp/out.html
         '''
       }
     }
@@ -137,9 +151,7 @@ PY
 
   post {
     always {
-      sh '''
-        docker image prune -af || true
-      '''
+      sh 'docker image prune -af || true'
     }
   }
 }
